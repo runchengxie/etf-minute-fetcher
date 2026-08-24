@@ -6,6 +6,9 @@ venv/
 *.egg-info/
 build/
 dist/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Secrets / 本地配置（绝不追踪 token）
 .env

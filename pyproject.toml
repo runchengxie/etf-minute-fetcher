@@ -1,17 +1,23 @@
 [project]
 name = "etf-minute-fetcher"
-version = "0.1.0"
+version = "0.2.0"
 description = "抓取 ETF 分钟级行情（akshare 源）并落盘为 trade_date 分区的 parquet，对齐 ~/data/market-data-platform 的 etf/daily 结构。"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "akshare>=1.14",
+    "akshare>=1.18.94,<2",
     "pandas>=2.0",
     "pyarrow>=15.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 etf-min = "etf_minute_fetcher.cli:main"
+etf-min-check = "etf_minute_fetcher.check:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -19,3 +25,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/etf_minute_fetcher"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

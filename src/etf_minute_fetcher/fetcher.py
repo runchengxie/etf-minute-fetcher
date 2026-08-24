@@ -2,7 +2,8 @@
 
 数据来自东方财富（push2his.eastmoney.com / quote.eastmoney.com），
 优先通过 akshare 的 ``fund_etf_hist_min_em`` 拉取；当其 requests 请求被代理
-断开时，自动回退到系统 curl 直连东方财富。落盘结构刻意对齐
+断开时，自动回退到系统 curl 直连东方财富。对于 5/15/30/60 分钟周期，
+东方财富仍不可用时再回退到新浪历史分钟接口。落盘结构刻意对齐
 ``~/data/market-data-platform/assets/tushare/etf/daily``：按 ``trade_date``
 做 Hive 风格分区，单分区一个 ``part.parquet``，列名采用 tushare 风格
 （ts_code/open/high/low/close/vol/amount），并额外保留 ``trade_time`` 分钟时间戳。
@@ -42,6 +43,11 @@ _NUMERIC_COLUMNS = ["open", "high", "low", "close", "vol", "amount"]
 _VALID_PERIODS = {"1", "5", "15", "30", "60"}
 _EASTMONEY_MINUTE_URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
 _EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_SINA_KLINE_URL = (
+    "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "CN_MarketData.getKLineData"
+)
+_SINA_MAX_DATALEN = "20000"
 
 
 def _normalize_symbol(ts_code: str) -> str:
@@ -52,6 +58,12 @@ def _normalize_symbol(ts_code: str) -> str:
 def _eastmoney_market_id(symbol: str) -> str:
     """返回东方财富 ``secid`` 所需的市场编号。"""
     return "1" if symbol.startswith(("5", "6")) else "0"
+
+
+def _sina_market_symbol(symbol: str) -> str:
+    """返回新浪历史分钟接口需要的 ``sh512880`` / ``sz159993`` 代码。"""
+    market = "sh" if symbol.startswith(("5", "6")) else "sz"
+    return f"{market}{symbol}"
 
 
 def _fetch_eastmoney_with_curl(
@@ -157,6 +169,88 @@ def _fetch_eastmoney_with_curl(
     return pd.DataFrame(split_rows, columns=columns)
 
 
+def _fetch_sina_with_curl(
+    ts_code: str,
+    start_trade_date: str,
+    end_trade_date: str,
+    *,
+    period: str,
+) -> pd.DataFrame:
+    """用系统 curl 请求新浪历史分钟接口并还原成统一前置 schema。
+
+    新浪接口不接受日期范围参数，而是返回最近 ``datalen`` 根 K 线；调用方
+    会在标准化后按 ``start_trade_date`` / ``end_trade_date`` 截取。实测该接口
+    对 5/15/30/60 分钟周期最多返回约 5000 根，故这里使用较大的 ``datalen``
+    请求值，让上游返回其自身允许的最大数量。
+
+    新浪响应没有成交额字段，因此通过该回退路径得到的 ``amount`` 会按统一
+    schema 补成空值；不能把成交量和成交额混用。
+    """
+    del start_trade_date, end_trade_date
+    if period == "1":
+        raise ValueError("新浪历史分钟接口不提供可用的 1 分钟回退")
+
+    curl_path = shutil.which("curl")
+    if curl_path is None:
+        raise FileNotFoundError("未找到 curl；无法使用新浪历史分钟回退路径")
+
+    params = {
+        "symbol": _sina_market_symbol(_normalize_symbol(ts_code)),
+        "scale": period,
+        "ma": "no",
+        "datalen": _SINA_MAX_DATALEN,
+    }
+    command = [
+        curl_path,
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--noproxy",
+        "*",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "30",
+        "--get",
+        _SINA_KLINE_URL,
+    ]
+    for key, value in params.items():
+        command.extend(["--data-urlencode", f"{key}={value}"])
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ConnectionError(f"curl 请求新浪历史分钟失败（exit={result.returncode}）: {detail}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"新浪返回的 curl 响应不是 JSON: {result.stdout[:200]!r}") from exc
+
+    if not isinstance(payload, list):
+        raise TypeError(f"新浪历史分钟响应不是列表: {payload!r}")
+    columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
+    if not payload:
+        return pd.DataFrame(columns=columns)
+    if not all(isinstance(row, dict) for row in payload):
+        raise ValueError("新浪历史分钟响应的行不是对象列表")
+
+    raw = pd.DataFrame(payload).rename(
+        columns={
+            "day": "时间",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+        }
+    )
+    missing = [column for column in columns if column not in raw.columns]
+    if missing:
+        raise ValueError(f"新浪历史分钟响应缺少列: {missing}")
+    return raw[columns]
+
+
 def _validate_trade_date(trade_date: str) -> None:
     """校验 ``YYYYMMDD`` 交易日字符串。"""
     datetime.strptime(trade_date, "%Y%m%d")
@@ -187,6 +281,19 @@ def _normalize_frame(raw: pd.DataFrame | None, ts_code: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _filter_frame_to_range(
+    frame: pd.DataFrame,
+    start_trade_date: str,
+    end_trade_date: str,
+) -> pd.DataFrame:
+    """按交易日期边界截取标准化分钟线。"""
+    if frame.empty:
+        return frame.reset_index(drop=True)
+    start_ts = pd.Timestamp(datetime.strptime(start_trade_date, "%Y%m%d").replace(hour=9, minute=30))
+    end_ts = pd.Timestamp(datetime.strptime(end_trade_date, "%Y%m%d").replace(hour=15))
+    return frame.loc[frame["trade_time"].between(start_ts, end_ts)].reset_index(drop=True)
+
+
 def fetch_etf_minute_range(
     ts_code: str,
     start_trade_date: str,
@@ -198,7 +305,8 @@ def fetch_etf_minute_range(
 ) -> pd.DataFrame:
     """一次请求抓取单只 ETF 的分钟线日期区间。
 
-    ``period='1'`` 时受东方财富/akshare 上游限制，只能获得最近 5 个交易日。
+    ``period='1'`` 时受东方财富/akshare 上游限制，只能获得最近 5 个交易日；
+    其余周期在东方财富不可用时会尝试新浪历史分钟回退。
     """
     import akshare as ak
 
@@ -231,6 +339,7 @@ def fetch_etf_minute_range(
     if last_error is None:  # pragma: no cover - attempts >= 1 guarantees this
         raise RuntimeError("AKShare 请求未执行")
 
+    eastmoney_error: Exception | None = None
     try:
         fallback_raw = _fetch_eastmoney_with_curl(
             ts_code,
@@ -239,17 +348,36 @@ def fetch_etf_minute_range(
             period=period,
         )
         fallback_frame = _normalize_frame(fallback_raw, ts_code)
-        if fallback_frame.empty:
-            return fallback_frame
-
-        start_ts = pd.Timestamp(datetime.strptime(start_trade_date, "%Y%m%d").replace(hour=9, minute=30))
-        end_ts = pd.Timestamp(datetime.strptime(end_trade_date, "%Y%m%d").replace(hour=15))
-        return fallback_frame.loc[fallback_frame["trade_time"].between(start_ts, end_ts)].reset_index(drop=True)
+        filtered = _filter_frame_to_range(fallback_frame, start_trade_date, end_trade_date)
+        if period == "1" or not filtered.empty:
+            return filtered
+        eastmoney_error = RuntimeError("东方财富回退没有返回指定日期范围内的数据")
     except Exception as fallback_error:  # noqa: BLE001
+        eastmoney_error = fallback_error
+
+    if period != "1":
+        try:
+            sina_raw = _fetch_sina_with_curl(
+                ts_code,
+                start_trade_date,
+                end_trade_date,
+                period=period,
+            )
+            sina_frame = _normalize_frame(sina_raw, ts_code)
+            return _filter_frame_to_range(sina_frame, start_trade_date, end_trade_date)
+        except Exception as sina_error:
+            raise RuntimeError(
+                f"AKShare 请求失败: {type(last_error).__name__}: {last_error}; "
+                f"东方财富 curl 回退失败: {type(eastmoney_error).__name__}: {eastmoney_error}; "
+                f"新浪 curl 回退也失败: {type(sina_error).__name__}: {sina_error}"
+            ) from sina_error
+
+    if eastmoney_error is not None:
         raise RuntimeError(
             f"AKShare 请求失败: {type(last_error).__name__}: {last_error}; "
-            f"curl 直连回退也失败: {type(fallback_error).__name__}: {fallback_error}"
-        ) from fallback_error
+            f"curl 直连回退也失败: {type(eastmoney_error).__name__}: {eastmoney_error}"
+        ) from eastmoney_error
+    raise RuntimeError("分钟线回退路径未执行")  # pragma: no cover
 
 
 

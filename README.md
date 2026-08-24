@@ -1,7 +1,8 @@
 # etf-minute-fetcher
 
-用 [AKShare](https://akshare.akfamily.xyz/) 抓取 ETF 分钟级行情，并落盘为与
-`~/data/market-data-platform/assets/tushare/etf/daily` 对齐的 **`trade_date` 分区 parquet** 结构。
+用 [AKShare](https://akshare.akfamily.xyz/) 抓取 ETF 分钟级行情，并落盘为与现有
+日线数据结构对齐的 **`trade_date` 分区 parquet**。项目数据默认放在
+`~/data/etf-minute-fetcher/minute/`，不与 `market-data-platform` 的正式数据目录混用。
 
 数据来源优先使用东方财富，通过 AKShare 的 `fund_etf_hist_min_em` 接口拉取。
 如果 AKShare 内部的 Python `requests` 被代理断开，下载器会在重试后使用系统
@@ -79,7 +80,7 @@ uv run etf-min-check --symbol 159993.SZ
 etf-min \
   --symbols 512880.SH,159993.SZ \
   --days 5 \
-  --out ~/data/market-data-platform/assets/tushare/etf/minute/fund_min_1m
+  --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
 从目标文件读取：
@@ -88,7 +89,7 @@ etf-min \
 etf-min \
   --symbols-file symbols_target.txt \
   --days 5 \
-  --out ~/data/market-data-platform/assets/tushare/etf/minute/fund_min_1m
+  --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
 指定区间：
@@ -98,7 +99,7 @@ etf-min \
   --symbols 512880.SH \
   --start 20260820 \
   --end 20260824 \
-  --out ~/data/market-data-platform/assets/tushare/etf/minute/fund_min_1m
+  --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
 对于 `period=1`，如果 `--start` 超出最近 5 个交易日，上游不会返回那些旧日期，CLI 会把它们统计为 `empty`。本次完全没有写入或跳过任何数据分区时，CLI 返回非零状态码，避免“什么都没下到但退出码还是成功”的尴尬场面。

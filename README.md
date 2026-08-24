@@ -3,14 +3,14 @@
 用 [AKShare](https://akshare.akfamily.xyz/) 抓取 ETF 分钟级行情，并落盘为与
 `~/data/market-data-platform/assets/tushare/etf/daily` 对齐的 **`trade_date` 分区 parquet** 结构。
 
-数据来源为东方财富，优先通过 AKShare 的 `fund_etf_hist_min_em` 接口拉取。
-如果 AKShare 内部的 Python `requests` 被代理断开，下载器会在重试后自动使用
-系统 `curl` 直连同一接口作为回退路径。
+数据来源优先使用东方财富，通过 AKShare 的 `fund_etf_hist_min_em` 接口拉取。
+如果 AKShare 内部的 Python `requests` 被代理断开，下载器会在重试后使用系统
+`curl` 直连东方财富；5/15/30/60 分钟周期还会继续回退到新浪历史分钟接口。
 
 ## 重要限制
 
 - **1 分钟数据只提供最近 5 个交易日**。这是 AKShare/东方财富上游限制，不能用这个接口做长期 1 分钟历史回填。
-- `5/15/30/60` 分钟周期可以查询更长区间，但仍受东方财富接口可用性约束。
+- `5/15/30/60` 分钟周期可以查询更长区间。东方财富不可用时，新浪回退会返回其允许的最近一批 K 线，实测单次约 5000 根；新浪响应没有成交额，因此这些回退数据的 `amount` 为空。
 - 下载器会把一只 ETF 的日期区间合并成一次上游请求，再按 `trade_date` 拆分落盘，避免逐日重复下载同一份近 5 日数据。
 - 裸代码会按 AKShare 当前市场规则补后缀：`5/6` 开头 -> `.SH`，其余 -> `.SZ`。生产任务仍建议显式写完整 `ts_code`。
 
@@ -69,6 +69,8 @@ uv run etf-min-check --symbol 159993.SZ
 
 成功时会打印 AKShare 版本、返回行数、实际交易日和时间范围。若网络、东方财富接口或 schema 异常，命令返回非零状态码。
 
+当 `period` 为 `5/15/30/60` 且东方财富不可用时，命令会自动尝试新浪历史分钟接口；`amount` 为空属于该回退源的字段限制，不代表 OHLC 或成交量缺失。
+
 ## 下载
 
 抓取最近 5 个自然日窗口内可获得的 1 分钟数据：
@@ -114,11 +116,13 @@ https://push2his.eastmoney.com/api/qt/stock/trends2/get
 ```text
 DOMAIN-SUFFIX,push2his.eastmoney.com,DIRECT
 DOMAIN-SUFFIX,quote.eastmoney.com,DIRECT
+DOMAIN-SUFFIX,money.finance.sina.com.cn,DIRECT
 ```
 
 下载器的直连回退路径依赖系统已安装 `curl`。正常情况下仍优先使用 AKShare；只有
 AKShare 连续请求失败时才会调用 `curl --noproxy '*'`，因此不会改变已有可用环境的
-请求路径。
+请求路径。新浪回退只对 `5/15/30/60` 周期启用；当前没有可用的新浪 1 分钟历史
+回退。
 
 ## 数据发布
 

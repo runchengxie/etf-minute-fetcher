@@ -243,6 +243,41 @@ def test_curl_fallback_parses_minute_response(monkeypatch: pytest.MonkeyPatch):
     assert "secid=1.512880" in calls[0]
 
 
+def test_sina_fallback_parses_historical_minute_response(monkeypatch: pytest.MonkeyPatch):
+    response = [
+        {
+            "day": "2026-08-24 09:30:00",
+            "open": "1.000",
+            "high": "1.002",
+            "low": "0.999",
+            "close": "1.001",
+            "volume": "100",
+        }
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
+
+    monkeypatch.setattr(fetcher.shutil, "which", lambda name: "/usr/bin/curl")
+    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+
+    result = fetcher._fetch_sina_with_curl(
+        "512880.SH",
+        "20260824",
+        "20260824",
+        period="15",
+    )
+
+    assert result.columns.tolist() == ["时间", "开盘", "收盘", "最高", "最低", "成交量"]
+    assert result.iloc[0]["成交量"] == "100"
+    assert calls[0][calls[0].index("--noproxy") + 1] == "*"
+    assert "symbol=sh512880" in calls[0]
+    assert "scale=15" in calls[0]
+    assert "datalen=20000" in calls[0]
+
+
 def test_fetch_range_uses_curl_fallback_after_akshare_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -277,3 +312,44 @@ def test_fetch_range_uses_curl_fallback_after_akshare_failure(
 
     assert len(result) == 1
     assert result.iloc[0]["trade_time"] == pd.Timestamp("2026-08-24 09:30:00")
+
+
+def test_fetch_range_uses_sina_after_eastmoney_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def always_fail(**kwargs):
+        raise ConnectionError("requests path unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(fund_etf_hist_min_em=always_fail),
+    )
+    raw = pd.DataFrame(
+        {
+            "时间": ["2026-08-19 09:30:00", "2026-08-24 09:30:00"],
+            "开盘": [1.0, 1.1],
+            "收盘": [1.0, 1.1],
+            "最高": [1.0, 1.1],
+            "最低": [1.0, 1.1],
+            "成交量": [100, 110],
+        }
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_eastmoney_with_curl",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("eastmoney unavailable")),
+    )
+    monkeypatch.setattr(fetcher, "_fetch_sina_with_curl", lambda *args, **kwargs: raw)
+
+    result = fetcher.fetch_etf_minute_range(
+        "512880.SH",
+        "20260824",
+        "20260824",
+        period="15",
+        attempts=1,
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["trade_time"] == pd.Timestamp("2026-08-24 09:30:00")
+    assert result["amount"].isna().all()

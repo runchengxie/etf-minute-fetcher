@@ -1,63 +1,59 @@
 # 架构
 
-`etf-minute-fetcher` 把“选择哪些 ETF、怎样批量调度、从哪里取分钟行情、如何落盘”拆成独立边界。公开 CLI 负责组装这些能力，不承载具体网络或存储实现。
-
-## 数据流
+项目把“选择哪些 ETF、怎样调度、从哪里取分钟行情、如何落盘”拆成四个边界。CLI 只负责解析参数和组装组件。
 
 ```text
 CLI
  │
- ├─ UniverseProvider
- │    ├─ ExplicitUniverse
- │    ├─ FileUniverse
- │    └─ AkshareETFUniverse
+ ▼
+UniverseProvider
+ ├─ ExplicitUniverse
+ ├─ FileUniverse
+ └─ AkshareETFUniverse
  │
  ▼
 DownloadEngine
+ │  有界并发 / 任务启动级限速 / 重试队列 / checkpoint
  │
- │ bounded concurrency / rate limit / retry queue
- │ checkpoint / resume / batch summary
  ▼
 fetch_symbol_range()
- │
  ├─ MinuteDataProvider
- │    └─ FallbackMinuteProvider
- │         ├─ AkshareMinuteProvider
- │         ├─ EastMoneyCurlMinuteProvider
- │         └─ SinaCurlMinuteProvider
+ │  └─ FallbackMinuteProvider
+ │      ├─ AkshareMinuteProvider
+ │      ├─ EastMoneyCurlMinuteProvider
+ │      └─ SinaCurlMinuteProvider
  │
  └─ BarStorage
-      └─ ParquetBarStorage
+    └─ ParquetBarStorage
 ```
 
 ## Universe 层
 
-Universe 层只回答“本次任务包含哪些标的”。输出统一为 `Instrument`，下载层只消费规范化后的 `ts_code`。
+Universe 层只回答“本次任务包含哪些标的”，输出标准化的 `Instrument`。它不抓分钟数据，也不决定输出目录。
 
-- `ExplicitUniverse`：显式代码。
-- `FileUniverse`：文本文件中的代码。
-- `AkshareETFUniverse`：当前市场或历史 point-in-time ETF membership，并支持交易所、名称和基金类型筛选。
+- `ExplicitUniverse`：处理 `--symbols`。
+- `FileUniverse`：处理 `--symbols-file`。
+- `AkshareETFUniverse`：发现当前或历史 ETF，并支持交易所、名称和基金类型筛选。
 
-这层不抓分钟行情，也不决定输出目录。
+`--as-of` 使用历史 ETF 快照提供 point-in-time membership，避免直接用当前 ETF 列表做历史回测。当前仍没有独立、对称的官方 `list_date` / `delist_date` 生命周期表。
 
 ## DownloadEngine
 
 `DownloadEngine` 负责跨 ETF 的任务调度：
 
-- 有界线程池并发；
-- ETF 任务启动级限速；
-- 失败标的进入下一轮重试队列；
-- 原子 checkpoint；
-- 中断后恢复已成功标的；
-- 批量统计持久化。
+- 使用有界 `ThreadPoolExecutor`；
+- 把失败标的放入下一轮重试队列；
+- 原子写入 checkpoint；
+- 任务中断后跳过已经成功的 ETF；
+- 将最终统计写入 JSON。
 
-它把 `fetch_symbol_range()` 当作单标的执行单元，因此不依赖具体行情源和 parquet 细节。
+它把 `fetch_symbol_range()` 当作单 ETF 执行单元，因此不依赖具体行情源和 Parquet 细节。
 
-当前限速是 ETF 任务启动级。单个 provider 内部可能继续发生请求重试或 fallback；如果未来需要严格的 HTTP request quota，应在具体 Provider 或共享 transport 层实现。
+当前 `--rate-limit` 只限制 ETF 任务启动速率。一个任务内部可能继续产生 AKShare 重试、东方财富回退或新浪回退请求；严格的 HTTP request quota 需要在 Provider 或共享 transport 层实现。
 
 ## Provider 层
 
-`MinuteDataProvider` 定义统一的分钟行情读取接口：
+`MinuteDataProvider` 定义统一接口：
 
 ```python
 provider.fetch(
@@ -68,17 +64,13 @@ provider.fetch(
 )
 ```
 
-默认 `FallbackMinuteProvider` 保留原有数据源顺序：
+默认 `FallbackMinuteProvider` 按以下顺序尝试：
 
 1. `AkshareMinuteProvider`
 2. `EastMoneyCurlMinuteProvider`
-3. `SinaCurlMinuteProvider`（仅 5/15/30/60 分钟）
+3. `SinaCurlMinuteProvider`（仅 `5/15/30/60` 分钟）
 
-Provider 返回统一 schema 的 `DataFrame`，网络请求、源级重试、源特有字段解释和 fallback 都封装在这一层。新增数据源时实现 `MinuteDataProvider` 即可，不需要修改 `DownloadEngine`。
-
-## 标准化边界
-
-不同上游数据在 Provider 模块中规范为：
+Provider 负责网络请求、源级重试、字段解释、标准化和 fallback。它返回统一 schema：
 
 ```text
 ts_code
@@ -91,24 +83,17 @@ vol
 amount
 ```
 
-`amount` 在新浪回退源缺失时保留为空值，不把成交量冒充成交额。
+不同源之间当前是源级切换，不会自动把多个源的部分窗口拼接成一个结果。新浪没有成交额时，`amount` 保持为空。
 
 ## Storage 层
 
-`BarStorage` 只负责分区是否存在和数据写入：
-
-```python
-storage.exists(output_dir, trade_date)
-storage.write(frame, output_dir, trade_date)
-```
-
-默认 `ParquetBarStorage` 保持现有 Hive 风格目录：
+`BarStorage` 只负责分区是否存在和数据写入。默认实现 `ParquetBarStorage` 使用：
 
 ```text
 <out>/<ts_code>/trade_date=YYYYMMDD/part.parquet
 ```
 
-写入使用临时文件再原子替换。以后需要对象存储、DuckDB 或其他布局时，可以新增 Storage adapter，而不用改 Provider。
+写入先写临时文件，再原子替换目标文件。以后增加 DuckDB、对象存储或其他目录布局时，可以新增 Storage adapter，而不修改 Provider。
 
 ## 兼容边界
 
@@ -119,12 +104,8 @@ storage.write(frame, output_dir, trade_date)
 - `fetch_symbol_range()`
 - `write_partition()`
 
-它们默认使用当前 Provider/Storage 实现，同时允许注入替代实现。这样旧调用方不需要因内部重构立即迁移。
+它们默认使用当前 Provider 和 Storage，也允许注入替代实现，旧调用方不需要立即迁移。
 
-## 尚未覆盖
+## 与其他项目的边界
 
-- 精确、对称的沪深 ETF 官方上市/退市生命周期元数据；
-- HTTP 请求级统一 quota/rate-limit transport；
-- 正式数据平台中的 ETF 日线注册、reader 和 Dashboard 展示。
-
-最后一项属于 `market-data-platform` 的共享数据控制面与消费接口，应在该仓单独设计和实现，避免让抓取器反过来承担 Dashboard 职责。
+Dashboard 通过本地 Parquet 目录读取分钟数据，具体 reader、日线数据源、在线回退和前端展示属于 Dashboard 仓库。数据平台的正式 ETF daily current contract 也属于 `market-data-platform` 的发布职责，不由本项目直接管理。

@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .fetcher import fetch_symbol_range
+from .engine import DownloadConfig, DownloadEngine
 from .universe import AkshareETFUniverse, ExplicitUniverse, FileUniverse, normalize_ts_code
 
 
@@ -107,6 +107,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--period", choices=("1", "5", "15", "30", "60"), default="1", help="分钟粒度")
     parser.add_argument("--out", required=True, help="输出根目录（将创建 ts_code/trade_date=* 分区）")
     parser.add_argument("--no-skip", action="store_true", help="不跳过已存在的分区")
+    parser.add_argument("--workers", type=int, default=4, help="批量下载最大并发 ETF 数，默认 4")
+    parser.add_argument("--rate-limit", type=float, default=2.0, help="每秒最多启动的 ETF 请求任务数；0=不限速")
+    parser.add_argument("--symbol-attempts", type=int, default=2, help="失败 ETF 的批量级最大尝试次数")
+    parser.add_argument("--retry-delay", type=float, default=2.0, help="失败重试轮次之间的基础等待秒数")
+    parser.add_argument("--checkpoint", help="checkpoint JSON；默认 <out>/.download-checkpoint.json")
+    parser.add_argument("--stats-file", help="批量统计 JSON；默认 <out>/.download-summary.json")
+    parser.add_argument("--no-resume", action="store_true", help="忽略已有 checkpoint，重新调度所有标的")
     args = parser.parse_args(argv)
 
     try:
@@ -114,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
         end = args.end or _default_end()
         start = args.start or _start_from_end(end, args.days)
         trade_dates = _resolve_trade_dates(start, end)
+        config = DownloadConfig(
+            workers=args.workers,
+            rate_limit_per_second=args.rate_limit,
+            symbol_attempts=args.symbol_attempts,
+            retry_delay=args.retry_delay,
+            resume=not args.no_resume,
+        )
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -139,39 +153,41 @@ def main(argv: list[str] | None = None) -> int:
         scope = " " + " ".join(filters) if filters else ""
         print(f"[etf-min] universe={args.universe}{scope} resolved={len(symbols)}")
     print(f"[etf-min] 区间 {start}~{end}（{len(trade_dates)} 个自然日），period={args.period}")
+    print(
+        f"[etf-min] 调度 workers={config.workers} rate_limit={config.rate_limit_per_second}/s "
+        f"symbol_attempts={config.symbol_attempts} resume={config.resume}"
+    )
     print(f"[etf-min] 输出 {output_dir}")
     if args.period == "1":
         print("[etf-min] 注意: AKShare/东方财富 1 分钟接口只提供最近 5 个交易日；更早日期会显示 empty")
 
-    total_written = total_skipped = total_empty = 0
-    all_errors: dict[str, str] = {}
-    for sym in symbols:
-        stats = fetch_symbol_range(
-            sym,
+    checkpoint_path = Path(args.checkpoint).expanduser().resolve() if args.checkpoint else None
+    stats_path = Path(args.stats_file).expanduser().resolve() if args.stats_file else None
+    try:
+        summary = DownloadEngine(config).run(
+            symbols,
             trade_dates,
             period=args.period,
-            output_dir=output_dir / sym,
+            output_dir=output_dir,
             skip_existing=not args.no_skip,
+            checkpoint_path=checkpoint_path,
+            stats_path=stats_path,
         )
-        total_written += len(stats["written"])
-        total_skipped += len(stats["skipped"])
-        total_empty += len(stats["empty"])
-        all_errors.update({f"{sym}/{k}": v for k, v in stats["errors"].items()})
-        print(
-            f"  {sym}: written={len(stats['written'])} "
-            f"skipped={len(stats['skipped'])} empty={len(stats['empty'])} "
-            f"errors={len(stats['errors'])}"
-        )
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     print(
-        f"[etf-min] 汇总: written={total_written} skipped={total_skipped} "
-        f"empty={total_empty} errors={len(all_errors)}"
+        f"[etf-min] 汇总: completed={summary.completed_symbols}/{summary.total_symbols} "
+        f"resumed={summary.resumed_symbols} written={summary.written_partitions} "
+        f"skipped={summary.skipped_partitions} empty={summary.empty_partitions} "
+        f"failed={summary.failed_symbols}"
     )
-    if all_errors:
-        for key, value in all_errors.items():
-            print(f"  ERR {key}: {value}")
+    if summary.failures:
+        for symbol, message in summary.failures.items():
+            print(f"  ERR {symbol}: {message}")
         return 1
-    if total_written == 0 and total_skipped == 0:
+    if summary.written_partitions == 0 and summary.skipped_partitions == 0:
         print("ERROR: 本次没有产生任何数据分区；请检查日期窗口、ETF 代码或上游接口状态", file=sys.stderr)
         return 3
     return 0

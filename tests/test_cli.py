@@ -35,3 +35,26 @@ def test_resolve_symbols_deduplicates_and_reads_file(tmp_path):
     args = argparse.Namespace(symbols="512880,159993.SZ", symbols_file=str(symbols_file))
 
     assert _resolve_symbols(args) == ["512880.SH", "159993.SZ"]
+
+
+def test_resolve_symbols_accepts_current_etf_universe(monkeypatch):
+    class FakeUniverse:
+        def __init__(self, *, exchange, name_contains):
+            assert exchange == "SH"
+            assert name_contains == "红利"
+
+        def get_instruments(self):
+            from etf_minute_fetcher.models import Instrument
+
+            return [Instrument.from_ts_code("515080.SH", name="红利低波")]
+
+    monkeypatch.setattr("etf_minute_fetcher.cli.AkshareETFUniverse", FakeUniverse)
+    args = argparse.Namespace(
+        symbols=None,
+        symbols_file=None,
+        universe="cn-etf",
+        exchange="SH",
+        match="红利",
+    )
+
+    assert _resolve_symbols(args) == ["515080.SH"]

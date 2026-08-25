@@ -1,6 +1,6 @@
 [project]
 name = "etf-minute-fetcher"
-version = "0.2.0"
+version = "0.3.0"
 description = "抓取 ETF 分钟级行情（akshare 源）并落盘为 trade_date 分区的 parquet，对齐 ~/data/market-data-platform 的 etf/daily 结构。"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -25,6 +25,10 @@ from typing import Any
 
 import pandas as pd
 
+from .models import Instrument
+from .providers.base import MinuteDataProvider
+from .storage import BarStorage
+
 # akshare fund_etf_hist_min_em 返回的中文列 -> 统一英文列
 _COLUMN_MAP = {
     "时间": "trade_time",
@@ -432,6 +436,8 @@ def fetch_symbol_range(
     period: str = "1",
     output_dir: Path,
     skip_existing: bool = True,
+    storage: BarStorage | None = None,
+    provider: MinuteDataProvider | None = None,
 ) -> dict[str, Any]:
     """抓取一只 ETF 在多个交易日区间的分钟线并落盘。
 
@@ -446,11 +452,13 @@ def fetch_symbol_range(
     empty: list[str] = []
     errors: dict[str, str] = {}
     pending: list[str] = []
+    instrument = Instrument.from_ts_code(ts_code)
 
     for td in trade_dates:
         _validate_trade_date(td)
         part_dir = output_dir / f"trade_date={td}"
-        if skip_existing and (part_dir / "part.parquet").exists():
+        already_exists = storage.exists(instrument, td) if storage else (part_dir / "part.parquet").exists()
+        if skip_existing and already_exists:
             skipped.append(td)
             continue
         pending.append(td)
@@ -459,7 +467,10 @@ def fetch_symbol_range(
         return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
 
     try:
-        frame = fetch_etf_minute_range(ts_code, min(pending), max(pending), period=period)
+        if provider:
+            frame = provider.fetch(instrument, min(pending), max(pending), period=period)
+        else:
+            frame = fetch_etf_minute_range(ts_code, min(pending), max(pending), period=period)
     except Exception as exc:  # noqa: BLE001
         message = f"{type(exc).__name__}: {exc}"
         errors.update({td: message for td in pending})
@@ -475,6 +486,9 @@ def fetch_symbol_range(
         if day_df.empty:
             empty.append(td)
             continue
-        write_partition(day_df, output_dir, td)
+        if storage:
+            storage.write(instrument, td, day_df)
+        else:
+            write_partition(day_df, output_dir, td)
         written.append(td)
     return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}

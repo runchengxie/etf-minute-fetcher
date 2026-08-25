@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
+from .downloader import DownloadConfig, DownloadEngine
 from .fetcher import fetch_etf_minute, fetch_etf_minute_range, fetch_symbol_range, write_partition
+from .models import Instrument
+from .storage import ParquetStorage
 
-__all__ = ["fetch_etf_minute", "fetch_etf_minute_range", "fetch_symbol_range", "write_partition"]
+__all__ = [
+    "DownloadConfig",
+    "DownloadEngine",
+    "Instrument",
+    "ParquetStorage",
+    "fetch_etf_minute",
+    "fetch_etf_minute_range",
+    "fetch_symbol_range",
+    "write_partition",
+]

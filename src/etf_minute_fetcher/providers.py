@@ -109,6 +109,7 @@ class AkshareMinuteProvider:
         *,
         period: str = "1",
     ) -> pd.DataFrame:
+        validate_request(start_trade_date, end_trade_date, period)
         import akshare as ak
 
         last_error: Exception | None = None
@@ -140,6 +141,7 @@ class EastMoneyCurlMinuteProvider:
         *,
         period: str = "1",
     ) -> pd.DataFrame:
+        validate_request(start_trade_date, end_trade_date, period)
         raw = _fetch_eastmoney_with_curl(
             ts_code,
             start_trade_date,
@@ -163,6 +165,7 @@ class SinaCurlMinuteProvider:
         *,
         period: str = "1",
     ) -> pd.DataFrame:
+        validate_request(start_trade_date, end_trade_date, period)
         raw = _fetch_sina_with_curl(
             ts_code,
             start_trade_date,
@@ -193,10 +196,11 @@ class FallbackMinuteProvider:
     ) -> pd.DataFrame:
         validate_request(start_trade_date, end_trade_date, period)
         primary = AkshareMinuteProvider(attempts=self.attempts, retry_delay=self.retry_delay)
+        primary_error: Exception | None = None
         try:
             return primary.fetch(ts_code, start_trade_date, end_trade_date, period=period)
-        except Exception as primary_error:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            primary_error = exc
 
         eastmoney_error: Exception | None = None
         try:

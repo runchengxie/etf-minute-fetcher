@@ -1,27 +1,54 @@
-"""Public ETF minute-fetch orchestration API.
+"""ETF 分钟行情的公开编排接口。
 
-Provider-specific network behavior lives in :mod:`etf_minute_fetcher.providers` and
-persistence lives in :mod:`etf_minute_fetcher.storage`. This module keeps the original
-public functions as stable compatibility boundaries for callers and the DownloadEngine.
+具体网络请求放在 ``providers`` 模块，落盘实现放在 ``storage`` 模块。这里保留原有公开
+函数，作为调用方和 ``DownloadEngine`` 的稳定边界。
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import pandas as pd
 
-from .providers import FallbackMinuteProvider, MinuteDataProvider, OUTPUT_COLUMNS, validate_request
+from .providers import (
+    OUTPUT_COLUMNS,
+    FallbackMinuteProvider,
+    MinuteDataProvider,
+    validate_request,
+)
 from .storage import BarStorage, ParquetBarStorage
 
-# Backward-compatible schema constant used by callers/tests.
+# 保留兼容常量，已有调用方和测试仍可继续引用。
 _OUTPUT_COLUMNS = OUTPUT_COLUMNS
+
+
+class FetchStats(TypedDict):
+    """单只 ETF 下载任务的结构化统计结果。"""
+
+    written: list[str]
+    skipped: list[str]
+    empty: list[str]
+    errors: dict[str, str]
 
 
 def _validate_trade_date(trade_date: str) -> None:
     datetime.strptime(trade_date, "%Y%m%d")
+
+
+def _stats(
+    written: list[str],
+    skipped: list[str],
+    empty: list[str],
+    errors: dict[str, str],
+) -> FetchStats:
+    return FetchStats(
+        written=written,
+        skipped=skipped,
+        empty=empty,
+        errors=errors,
+    )
 
 
 def fetch_etf_minute_range(
@@ -34,18 +61,20 @@ def fetch_etf_minute_range(
     retry_delay: float = 1.0,
     provider: MinuteDataProvider | None = None,
 ) -> pd.DataFrame:
-    """Fetch normalized minute bars for one ETF and date range.
+    """抓取单只 ETF 在指定日期范围内的标准化分钟行情。
 
-    When ``provider`` is omitted the default fallback chain remains AKShare ->
-    EastMoney curl -> Sina curl. Supplying a provider makes the network source
-    replaceable without changing callers.
+    未传入 ``provider`` 时使用默认回退链路：AKShare、东方财富 curl、新浪 curl。
+    传入自定义实现后，调用方无需修改编排逻辑即可替换数据源。
     """
     validate_request(start_trade_date, end_trade_date, period)
     if attempts < 1:
         raise ValueError("attempts 必须 >= 1")
     if retry_delay < 0:
         raise ValueError("retry_delay 必须 >= 0")
-    resolved_provider = provider or FallbackMinuteProvider(attempts=attempts, retry_delay=retry_delay)
+    resolved_provider = provider or FallbackMinuteProvider(
+        attempts=attempts,
+        retry_delay=retry_delay,
+    )
     return resolved_provider.fetch(
         ts_code,
         start_trade_date,
@@ -61,7 +90,7 @@ def fetch_etf_minute(
     period: str = "1",
     provider: MinuteDataProvider | None = None,
 ) -> pd.DataFrame:
-    """Fetch one trading day's normalized minute bars."""
+    """抓取单只 ETF 某一交易日的标准化分钟行情。"""
     return fetch_etf_minute_range(
         ts_code,
         trade_date,
@@ -78,7 +107,7 @@ def write_partition(
     *,
     storage: BarStorage | None = None,
 ) -> Path | None:
-    """Write one trade-date partition using the configured storage adapter."""
+    """通过配置的存储实现写入一个交易日分区。"""
     resolved_storage = storage or ParquetBarStorage()
     return resolved_storage.write(df, output_dir, trade_date)
 
@@ -92,11 +121,11 @@ def fetch_symbol_range(
     skip_existing: bool = True,
     provider: MinuteDataProvider | None = None,
     storage: BarStorage | None = None,
-) -> dict[str, Any]:
-    """Fetch one ETF across multiple dates and persist date partitions.
+) -> FetchStats:
+    """抓取单只 ETF 的多个日期，并按交易日分区落盘。
 
-    The orchestration layer depends only on ``MinuteDataProvider`` and ``BarStorage``.
-    Existing callers can omit both and retain the original behavior.
+    这一层只依赖 ``MinuteDataProvider`` 和 ``BarStorage`` 两个接口。未传入自定义实现时，
+    行为与原有公开 API 保持一致。
     """
     written: list[str] = []
     skipped: list[str] = []
@@ -105,15 +134,15 @@ def fetch_symbol_range(
     pending: list[str] = []
     resolved_storage = storage or ParquetBarStorage()
 
-    for td in trade_dates:
-        _validate_trade_date(td)
-        if skip_existing and resolved_storage.exists(output_dir, td):
-            skipped.append(td)
+    for trade_date in trade_dates:
+        _validate_trade_date(trade_date)
+        if skip_existing and resolved_storage.exists(output_dir, trade_date):
+            skipped.append(trade_date)
             continue
-        pending.append(td)
+        pending.append(trade_date)
 
     if not pending:
-        return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
+        return _stats(written, skipped, empty, errors)
 
     try:
         frame = fetch_etf_minute_range(
@@ -123,21 +152,22 @@ def fetch_symbol_range(
             period=period,
             provider=provider,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        # 单只 ETF 的执行边界把上游异常转换为按日期记录的任务错误。
         message = f"{type(exc).__name__}: {exc}"
-        errors.update({td: message for td in pending})
-        return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
+        errors.update({trade_date: message for trade_date in pending})
+        return _stats(written, skipped, empty, errors)
 
     if frame.empty:
         empty.extend(pending)
-        return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
+        return _stats(written, skipped, empty, errors)
 
     frame_trade_dates = frame["trade_time"].dt.strftime("%Y%m%d")
-    for td in pending:
-        day_df = frame.loc[frame_trade_dates == td].copy()
-        if day_df.empty:
-            empty.append(td)
+    for trade_date in pending:
+        day_frame = frame.loc[frame_trade_dates == trade_date].copy()
+        if day_frame.empty:
+            empty.append(trade_date)
             continue
-        resolved_storage.write(day_df, output_dir, td)
-        written.append(td)
-    return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
+        resolved_storage.write(day_frame, output_dir, trade_date)
+        written.append(trade_date)
+    return _stats(written, skipped, empty, errors)

@@ -1,4 +1,4 @@
-"""etf-minute-fetcher: 用 akshare 抓取 ETF 分钟级行情并落盘为分区 parquet。"""
+"""下载 ETF 分钟行情，并按交易日保存为 Parquet 分区。"""
 
 from __future__ import annotations
 

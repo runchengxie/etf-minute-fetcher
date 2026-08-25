@@ -14,6 +14,8 @@
 - `5/15/30/60` 分钟周期可以查询更长区间。东方财富不可用时，新浪回退会返回其允许的最近一批 K 线，实测单次约 5000 根；新浪响应没有成交额，因此这些回退数据的 `amount` 为空。
 - 下载器会把一只 ETF 的日期区间合并成一次上游请求，再按 `trade_date` 拆分落盘，避免逐日重复下载同一份近 5 日数据。
 - 裸代码会按 AKShare 当前市场规则补后缀：`5/6` 开头 -> `.SH`，其余 -> `.SZ`。生产任务仍建议显式写完整 `ts_code`。
+- `--universe cn-etf` 使用 `ak.fund_etf_spot_em()` 获取**当前时点**的沪深 ETF 列表。它不是历史 point-in-time universe；直接拿当前列表回填历史数据会带来幸存者偏差。
+- 当前批量下载仍按 ETF 顺序执行，没有在本次 universe 抽象中引入并发。全市场任务应留意上游限流和整体耗时。
 
 ## 落盘结构
 
@@ -92,6 +94,28 @@ etf-min \
   --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
+下载当前沪深全市场 ETF：
+
+```bash
+etf-min \
+  --universe cn-etf \
+  --days 5 \
+  --out ~/data/etf-minute-fetcher/minute/fund_min_1m
+```
+
+只下载当前上交所 ETF：
+
+```bash
+etf-min \
+  --universe cn-etf \
+  --exchange SH \
+  --days 5 \
+  --out ~/data/etf-minute-fetcher/minute/fund_min_1m
+```
+
+`--symbols`、`--symbols-file` 和 `--universe` 可以组合使用；最终标的会按规范化后的 `ts_code` 去重。
+`--exchange` 只用于筛选 `--universe` 自动发现的标的。
+
 指定区间：
 
 ```bash
@@ -103,6 +127,16 @@ etf-min \
 ```
 
 对于 `period=1`，如果 `--start` 超出最近 5 个交易日，上游不会返回那些旧日期，CLI 会把它们统计为 `empty`。本次完全没有写入或跳过任何数据分区时，CLI 返回非零状态码，避免“什么都没下到但退出码还是成功”的尴尬场面。
+
+## Universe 设计
+
+CLI 的标的输入现在统一经过 universe 层，最终产出标准化 `Instrument`：
+
+- `ExplicitUniverse`：处理 `--symbols`。
+- `FileUniverse`：处理 `--symbols-file`。
+- `AkshareETFUniverse`：通过 `fund_etf_spot_em()` 发现当前沪深 ETF，并可按 `SH` / `SZ` 筛选。
+
+这层只负责“下载哪些标的”，分钟行情抓取、回退和 parquet 落盘行为保持不变。后续可以在不改下载主流程的情况下增加历史 point-in-time universe 或其他标的来源。
 
 ## 网络要求
 

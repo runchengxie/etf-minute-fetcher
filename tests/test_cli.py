@@ -5,6 +5,7 @@ import argparse
 import pytest
 
 from etf_minute_fetcher.cli import _normalize_ts_code, _resolve_symbols, _resolve_trade_dates, _start_from_end
+from etf_minute_fetcher.models import Instrument
 
 
 def test_normalize_ts_code_infers_exchange():
@@ -35,3 +36,24 @@ def test_resolve_symbols_deduplicates_and_reads_file(tmp_path):
     args = argparse.Namespace(symbols="512880,159993.SZ", symbols_file=str(symbols_file))
 
     assert _resolve_symbols(args) == ["512880.SH", "159993.SZ"]
+
+
+def test_resolve_symbols_combines_current_universe(monkeypatch):
+    monkeypatch.setattr(
+        "etf_minute_fetcher.cli.AkshareETFUniverse.resolve",
+        lambda self: [Instrument("512880", "SH"), Instrument("159993", "SZ")],
+    )
+    args = argparse.Namespace(
+        symbols="512880.SH",
+        symbols_file=None,
+        universe="cn-etf",
+        exchange=None,
+    )
+
+    assert _resolve_symbols(args) == ["512880.SH", "159993.SZ"]
+
+
+def test_exchange_requires_universe():
+    args = argparse.Namespace(symbols="512880.SH", symbols_file=None, universe=None, exchange="SH")
+    with pytest.raises(ValueError, match="--exchange"):
+        _resolve_symbols(args)

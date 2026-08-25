@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -66,9 +67,17 @@ class FileUniverse:
 
 @dataclass(frozen=True, slots=True)
 class AkshareETFUniverse:
-    """Current mainland ETF universe returned by AKShare/EastMoney."""
+    """Resolve current or historical mainland ETF membership via AKShare.
+
+    Current discovery uses EastMoney's ``fund_etf_spot_em``. Historical snapshots
+    and fund-type filtering use the THS ETF snapshot endpoint because it accepts a
+    query date and exposes ``基金类型``.
+    """
 
     exchange: str | None = None
+    name_contains: str | None = None
+    fund_type: str | None = None
+    as_of: str | None = None
 
     def __post_init__(self) -> None:
         if self.exchange is not None:
@@ -76,6 +85,14 @@ class AkshareETFUniverse:
             if normalized not in VALID_EXCHANGES:
                 raise ValueError(f"不支持的交易所后缀: {self.exchange}")
             object.__setattr__(self, "exchange", normalized)
+        if self.name_contains is not None:
+            value = self.name_contains.strip()
+            object.__setattr__(self, "name_contains", value or None)
+        if self.fund_type is not None:
+            value = self.fund_type.strip()
+            object.__setattr__(self, "fund_type", value or None)
+        if self.as_of is not None:
+            _validate_snapshot_date(self.as_of)
 
     def resolve(self) -> list[Instrument]:
         try:
@@ -84,27 +101,58 @@ class AkshareETFUniverse:
             raise RuntimeError("未安装 akshare，无法获取 ETF universe") from exc
 
         try:
-            raw = ak.fund_etf_spot_em()
+            if self.as_of is not None or self.fund_type is not None:
+                raw = ak.fund_etf_spot_ths(date=self.as_of or "")
+                code_column = "基金代码"
+                name_column = "基金名称"
+                type_column = "基金类型"
+            else:
+                raw = ak.fund_etf_spot_em()
+                code_column = "代码"
+                name_column = "名称"
+                type_column = None
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"获取当前 ETF universe 失败: {type(exc).__name__}: {exc}") from exc
+            scope = f"（as_of={self.as_of}）" if self.as_of else ""
+            raise RuntimeError(f"获取 ETF universe{scope} 失败: {type(exc).__name__}: {exc}") from exc
 
         if raw is None or raw.empty:
             return []
-        missing = [column for column in ("代码", "名称") if column not in raw.columns]
+
+        required = [code_column, name_column]
+        if type_column is not None:
+            required.append(type_column)
+        missing = [column for column in required if column not in raw.columns]
         if missing:
             raise ValueError(f"AKShare ETF universe 缺少列: {missing}")
 
         instruments: list[Instrument] = []
-        for raw_code, raw_name in raw[["代码", "名称"]].itertuples(index=False, name=None):
+        selected_columns = [code_column, name_column] + ([type_column] if type_column else [])
+        for row in raw[selected_columns].itertuples(index=False, name=None):
+            raw_code, raw_name = row[0], row[1]
+            raw_fund_type = row[2] if type_column else None
             code = _coerce_code(raw_code)
             name = None if pd.isna(raw_name) else str(raw_name).strip() or None
+            fund_type = None if raw_fund_type is None or pd.isna(raw_fund_type) else str(raw_fund_type).strip()
             try:
                 instrument = instrument_from_symbol(code, name=name)
             except ValueError as exc:
                 raise ValueError(f"AKShare ETF universe 包含非法代码: {raw_code!r}") from exc
-            if self.exchange is None or instrument.exchange == self.exchange:
-                instruments.append(instrument)
+
+            if self.exchange is not None and instrument.exchange != self.exchange:
+                continue
+            if self.name_contains is not None and self.name_contains.casefold() not in (name or "").casefold():
+                continue
+            if self.fund_type is not None and (fund_type or "").casefold() != self.fund_type.casefold():
+                continue
+            instruments.append(instrument)
         return _deduplicate(instruments)
+
+
+def _validate_snapshot_date(value: str) -> None:
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError as exc:
+        raise ValueError(f"universe as_of 应为 YYYYMMDD: {value!r}") from exc
 
 
 def _coerce_code(value: object) -> str:

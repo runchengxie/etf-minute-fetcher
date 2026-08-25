@@ -14,8 +14,8 @@
 - `5/15/30/60` 分钟周期可以查询更长区间。东方财富不可用时，新浪回退会返回其允许的最近一批 K 线，实测单次约 5000 根；新浪响应没有成交额，因此这些回退数据的 `amount` 为空。
 - 下载器会把一只 ETF 的日期区间合并成一次上游请求，再按 `trade_date` 拆分落盘，避免逐日重复下载同一份近 5 日数据。
 - 裸代码会按 AKShare 当前市场规则补后缀：`5/6` 开头 -> `.SH`，其余 -> `.SZ`。生产任务仍建议显式写完整 `ts_code`。
-- `--universe cn-etf` 使用 `ak.fund_etf_spot_em()` 获取**当前时点**的沪深 ETF 列表。它不是历史 point-in-time universe；直接拿当前列表回填历史数据会带来幸存者偏差。
-- 当前批量下载仍按 ETF 顺序执行，没有在本次 universe 抽象中引入并发。全市场任务应留意上游限流和整体耗时。
+- `--universe cn-etf` 默认使用 `ak.fund_etf_spot_em()` 获取当前沪深 ETF；指定 `--as-of YYYYMMDD` 时改用 AKShare/同花顺的历史 ETF 快照，避免直接拿当前列表回填历史数据造成幸存者偏差。
+- 当前批量下载仍按 ETF 顺序执行，没有在 universe 抽象中引入并发。全市场任务应留意上游限流和整体耗时。
 
 ## 落盘结构
 
@@ -103,18 +103,32 @@ etf-min \
   --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
-只下载当前上交所 ETF：
+按交易所和名称筛选：
 
 ```bash
 etf-min \
   --universe cn-etf \
   --exchange SH \
+  --name-contains 红利 \
   --days 5 \
   --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
 
+按历史时点获取当时存在的 ETF universe：
+
+```bash
+etf-min \
+  --universe cn-etf \
+  --as-of 20240620 \
+  --fund-type 股票型 \
+  --start 20240620 \
+  --end 20240620 \
+  --period 5 \
+  --out ~/data/etf-minute-fetcher/minute/fund_min_5m
+```
+
 `--symbols`、`--symbols-file` 和 `--universe` 可以组合使用；最终标的会按规范化后的 `ts_code` 去重。
-`--exchange` 只用于筛选 `--universe` 自动发现的标的。
+`--exchange`、`--name-contains`、`--fund-type`、`--as-of` 只用于筛选 `--universe` 自动发现的标的。
 
 指定区间：
 
@@ -130,13 +144,13 @@ etf-min \
 
 ## Universe 设计
 
-CLI 的标的输入现在统一经过 universe 层，最终产出标准化 `Instrument`：
+CLI 的标的输入统一经过 universe 层，最终产出标准化 `Instrument`：
 
 - `ExplicitUniverse`：处理 `--symbols`。
 - `FileUniverse`：处理 `--symbols-file`。
-- `AkshareETFUniverse`：通过 `fund_etf_spot_em()` 发现当前沪深 ETF，并可按 `SH` / `SZ` 筛选。
+- `AkshareETFUniverse`：默认通过 `fund_etf_spot_em()` 发现当前沪深 ETF；使用 `--as-of` 或 `--fund-type` 时通过 `fund_etf_spot_ths()` 获取可按日期查询、带基金类型的快照。
 
-这层只负责“下载哪些标的”，分钟行情抓取、回退和 parquet 落盘行为保持不变。后续可以在不改下载主流程的情况下增加历史 point-in-time universe 或其他标的来源。
+这层负责“下载哪些标的”。`--as-of` 提供 point-in-time membership，解决历史回测直接使用当前 ETF 列表的幸存者偏差问题。精确官方上市/退市日期目前没有从沪深两市获得对称、稳定的 AKShare 元数据，因此本项目暂不伪造这两个字段；后续可单独接入交易所生命周期元数据源。
 
 ## 网络要求
 

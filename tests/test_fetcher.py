@@ -10,6 +10,8 @@ import pandas as pd
 import pytest
 
 import etf_minute_fetcher.fetcher as fetcher
+import etf_minute_fetcher.providers as providers
+from etf_minute_fetcher.storage import ParquetBarStorage
 
 
 def _install_fake_akshare(monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame) -> list[dict[str, str]]:
@@ -56,16 +58,7 @@ def test_fetch_etf_minute_normalizes_columns(monkeypatch: pytest.MonkeyPatch):
 
     result = fetcher.fetch_etf_minute("512880.SH", "20260824")
 
-    assert list(result.columns) == [
-        "ts_code",
-        "trade_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "vol",
-        "amount",
-    ]
+    assert list(result.columns) == fetcher._OUTPUT_COLUMNS
     assert result["ts_code"].tolist() == ["512880.SH", "512880.SH"]
     assert pd.api.types.is_datetime64_any_dtype(result["trade_time"])
     assert calls == [
@@ -138,7 +131,7 @@ def test_fetch_range_retries_transient_error(monkeypatch: pytest.MonkeyPatch):
         "akshare",
         types.SimpleNamespace(fund_etf_hist_min_em=fund_etf_hist_min_em),
     )
-    monkeypatch.setattr(fetcher.time, "sleep", sleeps.append)
+    monkeypatch.setattr(providers.time, "sleep", sleeps.append)
 
     result = fetcher.fetch_etf_minute_range(
         "512880.SH",
@@ -151,6 +144,21 @@ def test_fetch_range_retries_transient_error(monkeypatch: pytest.MonkeyPatch):
     assert len(result) == 1
     assert calls == 3
     assert sleeps == [0.25, 0.5]
+
+
+def test_fetch_range_accepts_injected_provider():
+    class FakeProvider:
+        def fetch(self, ts_code, start_trade_date, end_trade_date, *, period="1"):
+            return _minute_frame("2026-08-24 09:30:00")
+
+    result = fetcher.fetch_etf_minute_range(
+        "512880.SH",
+        "20260824",
+        "20260824",
+        provider=FakeProvider(),
+    )
+
+    assert len(result) == 1
 
 
 def test_write_partition(tmp_path: Path):
@@ -172,6 +180,7 @@ def test_fetch_symbol_range_uses_one_upstream_call(monkeypatch: pytest.MonkeyPat
         end_trade_date: str,
         *,
         period: str = "1",
+        provider=None,
     ) -> pd.DataFrame:
         calls.append((ts_code, start_trade_date, end_trade_date, period))
         return _minute_frame("2026-08-23 09:30:00", "2026-08-24 09:30:00")
@@ -213,6 +222,39 @@ def test_fetch_symbol_range_marks_dates_without_rows_empty(monkeypatch: pytest.M
     assert stats["empty"] == ["20260823"]
 
 
+def test_fetch_symbol_range_accepts_storage_adapter(tmp_path: Path):
+    writes: list[str] = []
+
+    class MemoryStorage:
+        def exists(self, output_dir, trade_date):
+            return trade_date == "20260823"
+
+        def write(self, df, output_dir, trade_date):
+            writes.append(trade_date)
+            return None
+
+    class FakeProvider:
+        def fetch(self, ts_code, start_trade_date, end_trade_date, *, period="1"):
+            return _minute_frame("2026-08-24 09:30:00")
+
+    stats = fetcher.fetch_symbol_range(
+        "512880.SH",
+        ["20260823", "20260824"],
+        output_dir=tmp_path,
+        provider=FakeProvider(),
+        storage=MemoryStorage(),
+    )
+
+    assert stats["skipped"] == ["20260823"]
+    assert stats["written"] == ["20260824"]
+    assert writes == ["20260824"]
+
+
+def test_parquet_storage_partition_path(tmp_path: Path):
+    storage = ParquetBarStorage()
+    assert storage.partition_path(tmp_path, "20260824") == tmp_path / "trade_date=20260824" / "part.parquet"
+
+
 def test_curl_fallback_parses_minute_response(monkeypatch: pytest.MonkeyPatch):
     response = {
         "data": {
@@ -227,10 +269,10 @@ def test_curl_fallback_parses_minute_response(monkeypatch: pytest.MonkeyPatch):
         calls.append(command)
         return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
 
-    monkeypatch.setattr(fetcher.shutil, "which", lambda name: "/usr/bin/curl")
-    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(providers.shutil, "which", lambda name: "/usr/bin/curl")
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
 
-    result = fetcher._fetch_eastmoney_with_curl(
+    result = providers._fetch_eastmoney_with_curl(
         "512880.SH",
         "20260824",
         "20260824",
@@ -260,10 +302,10 @@ def test_sina_fallback_parses_historical_minute_response(monkeypatch: pytest.Mon
         calls.append(command)
         return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
 
-    monkeypatch.setattr(fetcher.shutil, "which", lambda name: "/usr/bin/curl")
-    monkeypatch.setattr(fetcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(providers.shutil, "which", lambda name: "/usr/bin/curl")
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
 
-    result = fetcher._fetch_sina_with_curl(
+    result = providers._fetch_sina_with_curl(
         "512880.SH",
         "20260824",
         "20260824",
@@ -278,9 +320,7 @@ def test_sina_fallback_parses_historical_minute_response(monkeypatch: pytest.Mon
     assert "datalen=20000" in calls[0]
 
 
-def test_fetch_range_uses_curl_fallback_after_akshare_failure(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_fetch_range_uses_curl_fallback_after_akshare_failure(monkeypatch: pytest.MonkeyPatch):
     def always_fail(**kwargs):
         raise ConnectionError("requests path unavailable")
 
@@ -301,7 +341,7 @@ def test_fetch_range_uses_curl_fallback_after_akshare_failure(
             "均价": [1.0, 1.1],
         }
     )
-    monkeypatch.setattr(fetcher, "_fetch_eastmoney_with_curl", lambda *args, **kwargs: raw)
+    monkeypatch.setattr(providers, "_fetch_eastmoney_with_curl", lambda *args, **kwargs: raw)
 
     result = fetcher.fetch_etf_minute_range(
         "512880.SH",
@@ -314,9 +354,7 @@ def test_fetch_range_uses_curl_fallback_after_akshare_failure(
     assert result.iloc[0]["trade_time"] == pd.Timestamp("2026-08-24 09:30:00")
 
 
-def test_fetch_range_uses_sina_after_eastmoney_failure(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_fetch_range_uses_sina_after_eastmoney_failure(monkeypatch: pytest.MonkeyPatch):
     def always_fail(**kwargs):
         raise ConnectionError("requests path unavailable")
 
@@ -336,11 +374,11 @@ def test_fetch_range_uses_sina_after_eastmoney_failure(
         }
     )
     monkeypatch.setattr(
-        fetcher,
+        providers,
         "_fetch_eastmoney_with_curl",
         lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("eastmoney unavailable")),
     )
-    monkeypatch.setattr(fetcher, "_fetch_sina_with_curl", lambda *args, **kwargs: raw)
+    monkeypatch.setattr(providers, "_fetch_sina_with_curl", lambda *args, **kwargs: raw)
 
     result = fetcher.fetch_etf_minute_range(
         "512880.SH",

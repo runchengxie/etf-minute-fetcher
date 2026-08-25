@@ -15,7 +15,7 @@
 - 下载器会把一只 ETF 的日期区间合并成一次上游请求，再按 `trade_date` 拆分落盘，避免逐日重复下载同一份近 5 日数据。
 - 裸代码会按 AKShare 当前市场规则补后缀：`5/6` 开头 -> `.SH`，其余 -> `.SZ`。生产任务仍建议显式写完整 `ts_code`。
 - `--universe cn-etf` 默认使用 `ak.fund_etf_spot_em()` 获取当前沪深 ETF；指定 `--as-of YYYYMMDD` 时改用 AKShare/同花顺的历史 ETF 快照，避免直接拿当前列表回填历史数据造成幸存者偏差。
-- 当前批量下载仍按 ETF 顺序执行，没有在 universe 抽象中引入并发。全市场任务应留意上游限流和整体耗时。
+- 批量下载默认使用 4 个 worker，并以每秒启动 2 个 ETF 任务做粗粒度限速。单只 ETF 内部仍可能执行 AKShare/东方财富/新浪自己的重试，因此这不是 HTTP 请求级限流器。
 
 ## 落盘结构
 
@@ -100,8 +100,19 @@ etf-min \
 etf-min \
   --universe cn-etf \
   --days 5 \
+  --workers 4 \
+  --rate-limit 2 \
   --out ~/data/etf-minute-fetcher/minute/fund_min_1m
 ```
+
+默认会在输出目录维护：
+
+```text
+.download-checkpoint.json
+.download-summary.json
+```
+
+checkpoint 记录逐 ETF 完成/失败状态。命令中断后以相同 `period`、日期范围和输出目录重新执行，会跳过已经成功完成的 ETF；使用 `--no-resume` 可忽略 checkpoint。失败 ETF 会进入下一轮重试队列，轮次数由 `--symbol-attempts` 控制。可用 `--checkpoint` 和 `--stats-file` 改写两个 JSON 的位置。
 
 按交易所和名称筛选：
 
@@ -151,6 +162,19 @@ CLI 的标的输入统一经过 universe 层，最终产出标准化 `Instrument
 - `AkshareETFUniverse`：默认通过 `fund_etf_spot_em()` 发现当前沪深 ETF；使用 `--as-of` 或 `--fund-type` 时通过 `fund_etf_spot_ths()` 获取可按日期查询、带基金类型的快照。
 
 这层负责“下载哪些标的”。`--as-of` 提供 point-in-time membership，解决历史回测直接使用当前 ETF 列表的幸存者偏差问题。精确官方上市/退市日期目前没有从沪深两市获得对称、稳定的 AKShare 元数据，因此本项目暂不伪造这两个字段；后续可单独接入交易所生命周期元数据源。
+
+## DownloadEngine
+
+`DownloadEngine` 负责批量任务调度，当前提供：
+
+- 有界线程池并发；
+- ETF 任务启动级限速；
+- 失败 ETF 重试队列；
+- 原子写入 checkpoint；
+- 中断后的全量任务恢复；
+- 最终批量统计 JSON 持久化。
+
+分钟源内部仍保留自己的请求级重试和 fallback。后续 Provider 抽象完成后，可以把更细粒度的 HTTP 限速下沉到具体 Provider。
 
 ## 网络要求
 

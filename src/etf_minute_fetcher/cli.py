@@ -47,16 +47,33 @@ def _resolve_symbols(args: argparse.Namespace) -> list[str]:
     symbols_file = getattr(args, "symbols_file", None)
     universe_name = getattr(args, "universe", None)
     exchange = getattr(args, "exchange", None)
+    name_contains = getattr(args, "name_contains", None)
+    fund_type = getattr(args, "fund_type", None)
+    as_of = getattr(args, "as_of", None)
 
-    if exchange and not universe_name:
-        raise ValueError("--exchange 只能与 --universe 一起使用")
+    universe_only_filters = {
+        "--exchange": exchange,
+        "--name-contains": name_contains,
+        "--fund-type": fund_type,
+        "--as-of": as_of,
+    }
+    invalid_filters = [flag for flag, value in universe_only_filters.items() if value and not universe_name]
+    if invalid_filters:
+        raise ValueError(f"{', '.join(invalid_filters)} 只能与 --universe 一起使用")
 
     if symbols_arg:
         providers.append(ExplicitUniverse([s.strip() for s in symbols_arg.split(",") if s.strip()]))
     if symbols_file:
         providers.append(FileUniverse(Path(symbols_file)))
     if universe_name == "cn-etf":
-        providers.append(AkshareETFUniverse(exchange=exchange))
+        providers.append(
+            AkshareETFUniverse(
+                exchange=exchange,
+                name_contains=name_contains,
+                fund_type=fund_type,
+                as_of=as_of,
+            )
+        )
 
     normalized: list[str] = []
     seen: set[str] = set()
@@ -79,8 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="etf-min", description="抓取 ETF 分钟线 (akshare)")
     parser.add_argument("--symbols", help="逗号分隔的 ts_code 列表，如 512880.SH,159993.SZ")
     parser.add_argument("--symbols-file", help="每行一个 ts_code 的文件")
-    parser.add_argument("--universe", choices=("cn-etf",), help="自动发现 ETF 标的集合；cn-etf=当前沪深 ETF")
+    parser.add_argument("--universe", choices=("cn-etf",), help="自动发现 ETF 标的集合；cn-etf=沪深 ETF")
     parser.add_argument("--exchange", choices=("SH", "SZ"), help="仅筛选 universe 中指定交易所 ETF")
+    parser.add_argument("--name-contains", help="按 ETF 名称包含关系筛选 universe")
+    parser.add_argument("--fund-type", help="按 AKShare/同花顺基金类型精确筛选，如 股票型、债券型")
+    parser.add_argument("--as-of", help="按 YYYYMMDD 获取历史 point-in-time ETF universe")
     parser.add_argument("--start", default=None, help="起始日期 YYYYMMDD")
     parser.add_argument("--end", default=None, help="结束日期 YYYYMMDD")
     parser.add_argument("--days", type=int, default=5, help="未指定 start 时，从 end 往前覆盖的自然日数")
@@ -107,7 +127,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[etf-min] symbols={_format_symbols_summary(symbols)}")
     if args.universe:
-        scope = f" exchange={args.exchange}" if args.exchange else ""
+        filters = []
+        if args.exchange:
+            filters.append(f"exchange={args.exchange}")
+        if args.name_contains:
+            filters.append(f"name~={args.name_contains!r}")
+        if args.fund_type:
+            filters.append(f"fund_type={args.fund_type!r}")
+        if args.as_of:
+            filters.append(f"as_of={args.as_of}")
+        scope = " " + " ".join(filters) if filters else ""
         print(f"[etf-min] universe={args.universe}{scope} resolved={len(symbols)}")
     print(f"[etf-min] 区间 {start}~{end}（{len(trade_dates)} 个自然日），period={args.period}")
     print(f"[etf-min] 输出 {output_dir}")

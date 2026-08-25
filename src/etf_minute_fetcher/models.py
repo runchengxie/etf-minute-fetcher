@@ -51,3 +51,16 @@ class Instrument:
     @property
     def ts_code(self) -> str:
         return f"{self.symbol}.{self.exchange}"
+
+    @classmethod
+    def from_ts_code(cls, value: str, **kwargs: object) -> "Instrument":
+        """Build an instrument from a bare or suffixed ETF code."""
+        raw = value.strip().upper()
+        if not raw:
+            raise ValueError("ETF 代码不能为空")
+        if "." in raw:
+            symbol, exchange = raw.rsplit(".", 1)
+        else:
+            symbol = raw
+            exchange = infer_etf_exchange(symbol)
+        return cls(symbol=symbol, exchange=exchange, **kwargs)

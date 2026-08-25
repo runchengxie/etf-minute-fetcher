@@ -25,6 +25,10 @@ from typing import Any
 
 import pandas as pd
 
+from .models import Instrument
+from .providers.base import MinuteDataProvider
+from .storage import BarStorage
+
 # akshare fund_etf_hist_min_em 返回的中文列 -> 统一英文列
 _COLUMN_MAP = {
     "时间": "trade_time",
@@ -430,8 +434,11 @@ def fetch_symbol_range(
     trade_dates: list[str],
     *,
     period: str = "1",
+    source: str = "auto",
     output_dir: Path,
     skip_existing: bool = True,
+    provider: MinuteDataProvider | None = None,
+    storage: BarStorage | None = None,
 ) -> dict[str, Any]:
     """抓取一只 ETF 在多个交易日区间的分钟线并落盘。
 
@@ -446,11 +453,13 @@ def fetch_symbol_range(
     empty: list[str] = []
     errors: dict[str, str] = {}
     pending: list[str] = []
+    instrument = Instrument.from_ts_code(ts_code)
 
     for td in trade_dates:
         _validate_trade_date(td)
         part_dir = output_dir / f"trade_date={td}"
-        if skip_existing and (part_dir / "part.parquet").exists():
+        already_exists = storage.exists(instrument, td) if storage else (part_dir / "part.parquet").exists()
+        if skip_existing and already_exists:
             skipped.append(td)
             continue
         pending.append(td)
@@ -459,7 +468,26 @@ def fetch_symbol_range(
         return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}
 
     try:
-        frame = fetch_etf_minute_range(ts_code, min(pending), max(pending), period=period)
+        if provider:
+            provider_kwargs: dict[str, Any] = {"period": period}
+            if source != "auto":
+                provider_kwargs["source"] = source
+            frame = provider.fetch(
+                instrument,
+                min(pending),
+                max(pending),
+                **provider_kwargs,
+            )
+        else:
+            fetch_kwargs: dict[str, Any] = {"period": period}
+            if source != "auto":
+                fetch_kwargs["source"] = source
+            frame = fetch_etf_minute_range(
+                ts_code,
+                min(pending),
+                max(pending),
+                **fetch_kwargs,
+            )
     except Exception as exc:  # noqa: BLE001
         message = f"{type(exc).__name__}: {exc}"
         errors.update({td: message for td in pending})
@@ -475,6 +503,9 @@ def fetch_symbol_range(
         if day_df.empty:
             empty.append(td)
             continue
-        write_partition(day_df, output_dir, td)
+        if storage:
+            storage.write(instrument, td, day_df)
+        else:
+            write_partition(day_df, output_dir, td)
         written.append(td)
     return {"written": written, "skipped": skipped, "empty": empty, "errors": errors}

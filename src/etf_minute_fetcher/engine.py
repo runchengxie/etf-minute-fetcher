@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .fetcher import fetch_symbol_range
+from .providers.base import MinuteDataProvider
+from .providers.legacy import LegacyMinuteProvider
+from .storage import BarStorage, ParquetStorage
 
 FetchSymbol = Callable[..., dict[str, Any]]
 
@@ -80,9 +83,13 @@ class DownloadEngine:
         config: DownloadConfig | None = None,
         *,
         fetch_symbol: FetchSymbol = fetch_symbol_range,
+        provider: MinuteDataProvider | None = None,
+        storage: BarStorage | None = None,
     ) -> None:
         self.config = config or DownloadConfig()
         self._fetch_symbol = fetch_symbol
+        self._provider = provider
+        self._storage = storage
         self._rate_limiter = _RateLimiter(self.config.rate_limit_per_second)
 
     def run(
@@ -95,6 +102,7 @@ class DownloadEngine:
         skip_existing: bool = True,
         checkpoint_path: Path | None = None,
         stats_path: Path | None = None,
+        source: str = "auto",
     ) -> DownloadSummary:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -102,11 +110,17 @@ class DownloadEngine:
         stats_path = stats_path or output_dir / ".download-summary.json"
         fingerprint = {
             "period": period,
+            "source": source,
             "trade_dates": trade_dates,
             "output_dir": str(output_dir.resolve()),
         }
         checkpoint = self._load_checkpoint(checkpoint_path, fingerprint)
         states: dict[str, dict[str, Any]] = checkpoint.setdefault("symbols", {})
+        provider = self._provider
+        storage = self._storage
+        if self._fetch_symbol is fetch_symbol_range:
+            provider = provider or LegacyMinuteProvider()
+            storage = storage or ParquetStorage(output_dir)
 
         resumed = 0
         pending: list[str] = []
@@ -130,6 +144,9 @@ class DownloadEngine:
                         period=period,
                         output_dir=output_dir / symbol,
                         skip_existing=skip_existing,
+                        provider=provider,
+                        storage=storage,
+                        source=source,
                     ): symbol
                     for symbol in pending
                 }
@@ -179,14 +196,26 @@ class DownloadEngine:
         period: str,
         output_dir: Path,
         skip_existing: bool,
+        provider: MinuteDataProvider | None,
+        storage: BarStorage | None,
+        source: str,
     ) -> dict[str, Any]:
         self._rate_limiter.acquire()
+        kwargs: dict[str, Any] = {
+            "period": period,
+            "output_dir": output_dir,
+            "skip_existing": skip_existing,
+        }
+        if provider is not None:
+            kwargs["provider"] = provider
+        if storage is not None:
+            kwargs["storage"] = storage
+        if source != "auto":
+            kwargs["source"] = source
         return self._fetch_symbol(
             symbol,
             trade_dates,
-            period=period,
-            output_dir=output_dir,
-            skip_existing=skip_existing,
+            **kwargs,
         )
 
     def _load_checkpoint(self, path: Path, fingerprint: dict[str, Any]) -> dict[str, Any]:

@@ -174,7 +174,23 @@ CLI 的标的输入统一经过 universe 层，最终产出标准化 `Instrument
 - 中断后的全量任务恢复；
 - 最终批量统计 JSON 持久化。
 
-分钟源内部仍保留自己的请求级重试和 fallback。后续 Provider 抽象完成后，可以把更细粒度的 HTTP 限速下沉到具体 Provider。
+分钟源内部仍保留自己的请求级重试和 fallback。当前已经提供 `MinuteDataProvider` 和 `BarStorage` 接口：`LegacyMinuteProvider` 适配现有 AKShare/东方财富/新浪实现，`ParquetStorage` 负责按 ETF/交易日分区和原子写入。后续可以在不改 `DownloadEngine` 的情况下替换具体 Provider 或存储后端。
+
+## Provider 与 Storage 分层
+
+`fetch_symbol_range()` 仍然兼容直接调用，但批量引擎默认通过以下边界运行：
+
+```text
+Instrument
+    ↓
+MinuteDataProvider.fetch()
+    ↓
+normalized DataFrame
+    ↓
+BarStorage.write()
+```
+
+本次分层先保留现有网络实现作为 `LegacyMinuteProvider`，避免在不改变数据源行为的情况下大规模搬迁代码。具体 AKShare、东方财富和新浪适配器仍可作为后续小 PR 独立拆出。
 
 ## 网络要求
 

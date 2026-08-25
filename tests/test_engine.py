@@ -108,6 +108,75 @@ def test_download_engine_rejects_mismatched_checkpoint(tmp_path: Path):
         )
 
 
+def test_download_engine_rejects_checkpoint_when_skip_policy_changes(tmp_path: Path):
+    config = DownloadConfig(
+        workers=1,
+        rate_limit_per_second=0,
+        symbol_attempts=1,
+        retry_delay=0,
+    )
+    engine = DownloadEngine(config, fetch_symbol=lambda *args, **kwargs: _ok(written=["20260824"]))
+    engine.run(
+        ["512880.SH"],
+        ["20260824"],
+        period="1",
+        output_dir=tmp_path,
+        skip_existing=True,
+    )
+
+    with pytest.raises(ValueError, match="覆盖策略"):
+        engine.run(
+            ["512880.SH"],
+            ["20260824"],
+            period="1",
+            output_dir=tmp_path,
+            skip_existing=False,
+        )
+
+
+def test_download_engine_accepts_legacy_checkpoint_with_default_skip_policy(tmp_path: Path):
+    config = DownloadConfig(
+        workers=1,
+        rate_limit_per_second=0,
+        symbol_attempts=1,
+        retry_delay=0,
+    )
+    engine = DownloadEngine(config, fetch_symbol=lambda *args, **kwargs: _ok(written=["20260824"]))
+    engine.run(["512880.SH"], ["20260824"], period="1", output_dir=tmp_path)
+
+    checkpoint_path = tmp_path / ".download-checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["fingerprint"].pop("skip_existing")
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    resumed = DownloadEngine(
+        config,
+        fetch_symbol=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy checkpoint should resume")
+        ),
+    ).run(["512880.SH"], ["20260824"], period="1", output_dir=tmp_path)
+
+    assert resumed.resumed_symbols == 1
+
+
+def test_download_engine_converts_unexpected_task_exception_to_failure(tmp_path: Path):
+    def fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    summary = DownloadEngine(
+        DownloadConfig(
+            workers=1,
+            rate_limit_per_second=0,
+            symbol_attempts=1,
+            retry_delay=0,
+        ),
+        fetch_symbol=fail,
+    ).run(["512880.SH"], ["20260824"], period="1", output_dir=tmp_path)
+
+    assert summary.failed_symbols == 1
+    assert "RuntimeError: boom" in summary.failures["512880.SH"]
+
+
 def test_download_config_validates_bounds():
     with pytest.raises(ValueError, match="workers"):
         DownloadConfig(workers=0)
@@ -115,3 +184,5 @@ def test_download_config_validates_bounds():
         DownloadConfig(rate_limit_per_second=-1)
     with pytest.raises(ValueError, match="symbol_attempts"):
         DownloadConfig(symbol_attempts=0)
+    with pytest.raises(ValueError, match="retry_delay"):
+        DownloadConfig(retry_delay=-1)

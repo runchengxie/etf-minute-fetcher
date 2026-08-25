@@ -7,20 +7,26 @@ venv/
 build/
 dist/
 .pytest_cache/
+.ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
-# Secrets / 本地配置（绝不追踪 token）
+# 本地配置和密钥
 .env
 .env.local
 .env.*
 !.env.example
 
-# 抓取的落盘数据默认不入库（体积大，单独管理）
+# 抓取结果和任务状态
 data/
 .etf-min-output/
+*.parquet
+.download-checkpoint.json
+.download-summary.json
 
-# 编辑器 / OS
+# 编辑器和系统文件
 .vscode/
 .idea/
 .DS_Store

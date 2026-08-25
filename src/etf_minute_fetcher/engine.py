@@ -1,22 +1,25 @@
-"""Bounded batch download engine with resume and persistent task state."""
+"""批量下载调度、重试和断点续传。"""
 
 from __future__ import annotations
 
 import json
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from .fetcher import fetch_symbol_range
+from .fetcher import FetchStats, fetch_symbol_range
 
-FetchSymbol = Callable[..., dict[str, Any]]
+FetchSymbol = Callable[..., FetchStats]
 
 
 @dataclass(frozen=True, slots=True)
 class DownloadConfig:
+    """批量下载的调度参数。"""
+
     workers: int = 4
     rate_limit_per_second: float = 2.0
     symbol_attempts: int = 2
@@ -36,6 +39,8 @@ class DownloadConfig:
 
 @dataclass(frozen=True, slots=True)
 class DownloadSummary:
+    """一次批量下载的汇总结果。"""
+
     total_symbols: int
     completed_symbols: int
     failed_symbols: int
@@ -50,6 +55,8 @@ class DownloadSummary:
 
 
 class _RateLimiter:
+    """限制 ETF 任务的启动速度。"""
+
     def __init__(self, rate_per_second: float) -> None:
         self._interval = 0.0 if rate_per_second <= 0 else 1.0 / rate_per_second
         self._lock = threading.Lock()
@@ -68,11 +75,10 @@ class _RateLimiter:
 
 
 class DownloadEngine:
-    """Run ETF downloads with bounded concurrency and durable checkpoints.
+    """以有限并发执行 ETF 下载，并持久化任务状态。
 
-    The rate limit is applied to symbol-attempt starts. A single symbol fetch can still
-    perform its own internal AKShare/EastMoney/Sina retries, so this is intentionally a
-    coarse-grained guard rather than an HTTP request interceptor.
+    限速发生在单只 ETF 的任务启动处。一次 ETF 下载内部仍可能发生 AKShare
+    重试或数据源回退，因此这里不等同于 HTTP 请求级限速。
     """
 
     def __init__(
@@ -104,6 +110,7 @@ class DownloadEngine:
             "period": period,
             "trade_dates": trade_dates,
             "output_dir": str(output_dir.resolve()),
+            "skip_existing": skip_existing,
         }
         checkpoint = self._load_checkpoint(checkpoint_path, fingerprint)
         states: dict[str, dict[str, Any]] = checkpoint.setdefault("symbols", {})
@@ -121,7 +128,10 @@ class DownloadEngine:
             if not pending:
                 break
             retry_queue: list[str] = []
-            with ThreadPoolExecutor(max_workers=self.config.workers, thread_name_prefix="etf-min") as pool:
+            with ThreadPoolExecutor(
+                max_workers=self.config.workers,
+                thread_name_prefix="etf-min",
+            ) as pool:
                 futures = {
                     pool.submit(
                         self._run_symbol,
@@ -137,16 +147,19 @@ class DownloadEngine:
                     symbol = futures[future]
                     try:
                         stats = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        stats = {
-                            "written": [],
-                            "skipped": [],
-                            "empty": [],
-                            "errors": {"engine": f"{type(exc).__name__}: {exc}"},
-                        }
-                    errors = stats.get("errors") or {}
+                    except Exception as exc:
+                        # 执行边界需要把单个任务异常转换成可持久化状态，避免整批中断。
+                        stats = FetchStats(
+                            written=[],
+                            skipped=[],
+                            empty=[],
+                            errors={"engine": f"{type(exc).__name__}: {exc}"},
+                        )
+                    errors = stats["errors"]
                     if errors:
-                        message = "; ".join(f"{key}: {value}" for key, value in sorted(errors.items()))
+                        message = "，".join(
+                            f"{key}: {value}" for key, value in sorted(errors.items())
+                        )
                         states[symbol] = {
                             "status": "failed",
                             "attempts": attempt,
@@ -179,7 +192,7 @@ class DownloadEngine:
         period: str,
         output_dir: Path,
         skip_existing: bool,
-    ) -> dict[str, Any]:
+    ) -> FetchStats:
         self._rate_limiter.acquire()
         return self._fetch_symbol(
             symbol,
@@ -189,7 +202,11 @@ class DownloadEngine:
             skip_existing=skip_existing,
         )
 
-    def _load_checkpoint(self, path: Path, fingerprint: dict[str, Any]) -> dict[str, Any]:
+    def _load_checkpoint(
+        self,
+        path: Path,
+        fingerprint: dict[str, Any],
+    ) -> dict[str, Any]:
         if not self.config.resume or not path.exists():
             return {"version": 1, "fingerprint": fingerprint, "symbols": {}}
         try:
@@ -198,10 +215,19 @@ class DownloadEngine:
             raise ValueError(f"无法读取 checkpoint {path}: {exc}") from exc
         if payload.get("version") != 1:
             raise ValueError(f"不支持的 checkpoint 版本: {payload.get('version')!r}")
-        if payload.get("fingerprint") != fingerprint:
-            raise ValueError("checkpoint 与本次 period/trade_dates/output_dir 不匹配；请换 checkpoint 或使用 --no-resume")
+
+        stored_fingerprint = payload.get("fingerprint")
+        if isinstance(stored_fingerprint, dict) and "skip_existing" not in stored_fingerprint:
+            # 0.2.0 早期检查点没有记录该字段。旧检查点按默认值 True 解释，
+            # 保持常规续传兼容，同时避免 --no-skip 误复用成功状态。
+            stored_fingerprint = {**stored_fingerprint, "skip_existing": True}
+        if stored_fingerprint != fingerprint:
+            raise ValueError(
+                "checkpoint 与本次周期、日期范围、输出目录或覆盖策略不匹配。"
+                "请更换 checkpoint，或使用 --no-resume"
+            )
         if not isinstance(payload.get("symbols"), dict):
-            raise ValueError("checkpoint symbols 字段无效")
+            raise ValueError("checkpoint 的 symbols 字段无效")
         return payload
 
     @staticmethod
@@ -209,7 +235,11 @@ class DownloadEngine:
         _atomic_write_json(path, payload)
 
     @staticmethod
-    def _summarize(symbols: list[str], states: dict[str, dict[str, Any]], resumed: int) -> DownloadSummary:
+    def _summarize(
+        symbols: list[str],
+        states: dict[str, dict[str, Any]],
+        resumed: int,
+    ) -> DownloadSummary:
         written = skipped = empty = completed = 0
         failures: dict[str, str] = {}
         for symbol in symbols:
@@ -234,17 +264,20 @@ class DownloadEngine:
         )
 
 
-def _serializable_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "written": list(stats.get("written") or []),
-        "skipped": list(stats.get("skipped") or []),
-        "empty": list(stats.get("empty") or []),
-        "errors": dict(stats.get("errors") or {}),
-    }
+def _serializable_stats(stats: FetchStats) -> FetchStats:
+    return FetchStats(
+        written=list(stats["written"]),
+        skipped=list(stats["skipped"]),
+        empty=list(stats["empty"]),
+        errors=dict(stats["errors"]),
+    )
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     tmp.replace(path)

@@ -1,4 +1,4 @@
-"""Storage abstractions for normalized ETF minute bars."""
+"""标准化 ETF 分钟行情的数据存储接口。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class BarStorage(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ParquetBarStorage:
-    """Hive-style trade-date partitioned parquet storage."""
+    """按交易日使用 Hive 风格目录分区的 Parquet 存储。"""
 
     filename: str = "part.parquet"
 

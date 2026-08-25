@@ -14,7 +14,9 @@ import etf_minute_fetcher.providers as providers
 from etf_minute_fetcher.storage import ParquetBarStorage
 
 
-def _install_fake_akshare(monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame) -> list[dict[str, str]]:
+def _install_fake_akshare(
+    monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame
+) -> list[dict[str, str]]:
     calls: list[dict[str, str]] = []
 
     def fund_etf_hist_min_em(**kwargs):
@@ -71,7 +73,9 @@ def test_fetch_etf_minute_normalizes_columns(monkeypatch: pytest.MonkeyPatch):
     ]
 
 
-def test_fetch_range_keeps_stable_schema_when_optional_column_missing(monkeypatch: pytest.MonkeyPatch):
+def test_fetch_range_keeps_stable_schema_when_optional_column_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
     raw = pd.DataFrame(
         {
             "时间": ["2026-08-24 09:30:00"],
@@ -205,7 +209,9 @@ def test_fetch_symbol_range_uses_one_upstream_call(monkeypatch: pytest.MonkeyPat
     }
 
 
-def test_fetch_symbol_range_marks_dates_without_rows_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_fetch_symbol_range_marks_dates_without_rows_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     monkeypatch.setattr(
         fetcher,
         "fetch_etf_minute_range",
@@ -252,7 +258,10 @@ def test_fetch_symbol_range_accepts_storage_adapter(tmp_path: Path):
 
 def test_parquet_storage_partition_path(tmp_path: Path):
     storage = ParquetBarStorage()
-    assert storage.partition_path(tmp_path, "20260824") == tmp_path / "trade_date=20260824" / "part.parquet"
+    assert (
+        storage.partition_path(tmp_path, "20260824")
+        == tmp_path / "trade_date=20260824" / "part.parquet"
+    )
 
 
 def test_curl_fallback_parses_minute_response(monkeypatch: pytest.MonkeyPatch):
@@ -279,7 +288,16 @@ def test_curl_fallback_parses_minute_response(monkeypatch: pytest.MonkeyPatch):
         period="1",
     )
 
-    assert result.columns.tolist() == ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
+    assert result.columns.tolist() == [
+        "时间",
+        "开盘",
+        "收盘",
+        "最高",
+        "最低",
+        "成交量",
+        "成交额",
+        "均价",
+    ]
     assert result.iloc[0]["成交量"] == "100"
     assert calls[0][calls[0].index("--noproxy") + 1] == "*"
     assert "secid=1.512880" in calls[0]

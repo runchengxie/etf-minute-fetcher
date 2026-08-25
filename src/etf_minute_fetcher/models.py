@@ -1,4 +1,4 @@
-"""Core instrument models shared by universe and download layers."""
+"""标的选择和下载层共用的数据模型。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ VALID_EXCHANGES = frozenset({"SH", "SZ"})
 
 
 def infer_etf_exchange(symbol: str) -> str:
-    """Infer the exchange for a six-digit mainland ETF code.
+    """按当前沪深 ETF 代码规则推断 6 位代码所属交易所。
 
-    The rule matches the current AKShare/EastMoney ETF market-id convention used by
-    this project. Keeping it here prevents CLI/universe code from duplicating it and
-    gives us one place to replace when an upstream source exposes exchange metadata.
+    规则与项目当前使用的 AKShare 和东方财富市场编号约定一致。统一放在这里可以避免
+    CLI 和标的选择代码重复判断。以后上游能稳定提供交易所字段时，也只需要替换这一处。
     """
 
     code = symbol.strip()
@@ -23,7 +22,7 @@ def infer_etf_exchange(symbol: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Instrument:
-    """A normalized tradable instrument used by the ingestion pipeline."""
+    """下载流程使用的标准化可交易标的。"""
 
     symbol: str
     exchange: str
@@ -41,7 +40,7 @@ class Instrument:
         if exchange not in VALID_EXCHANGES:
             raise ValueError(f"不支持的交易所后缀: {exchange}")
         if asset_type != "ETF":
-            raise ValueError(f"当前只支持 ETF instrument: {self.asset_type!r}")
+            raise ValueError(f"当前只支持 ETF 标的: {self.asset_type!r}")
 
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "exchange", exchange)
